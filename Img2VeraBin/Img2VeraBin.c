@@ -40,17 +40,22 @@ enum {
 _sColorRGBA8 palette[16][16] = { 0 };
 int palette_size_x = 0, palette_size_y = 0;
 
+
+void PrintHelp(int argn);
+
 // asks for an exact match
 // returns 1 if true 0 if false
 // actual index is returned though a pointer
-uint8_t IsColorInPalette(_sColorRGBA8 color, uint8_t palette_y, uint8_t palette_bpp, _tColorIndexed* index);
-void GetClosestColorInPalette(_sColorRGBA8 color, uint8_t palette_y, uint8_t palette_bpp, _tColorIndexed* index, float* dist);
+uint8_t IsColorInPalette(_sColorRGBA8 color, uint8_t palette_y, _eBpp palette_bpp, _tColorIndexed* index);
+void GetClosestColorInPalette(_sColorRGBA8 color, uint8_t palette_y, _eBpp palette_bpp, _tColorIndexed* index, float* dist);
 float GetColorDistance(_sColorRGBA8 c1, _sColorRGBA8 c2);
 void PrintPaletteRGBA8(uint8_t palette_y);
 
 void AutoBuildPalette(_sColorRGBA8* src, int w, int h);
 void BuildPaletteFromImage(_sColorRGBA8* p_img, int img_w, int img_h);
 _sColorRGBA8* ExtractImageSegment(_sColorRGBA8* src_img, int src_w, int src_h, int x, int y, int w, int h);
+_tColorIndexed* ConvertRGBAtoIndexed(_sColorRGBA8* src_img, int img_w, int img_h, uint8_t palette_y, _eBpp palette_bpp, float* total_dist);
+uint8_t* PackIndexedImage(_tColorIndexed* src_img, int* packed_size, int img_w, int img_h, _eBpp palette_bpp);
 
 
 #define STRING_BUFFER_SIZE  400
@@ -62,24 +67,31 @@ enum {
     PALETTE_USE_IMAGE,
 }palette_mode = PALETTE_AUTO;
 
-void PrintHelp(int argn);
 
 int main(int argc, char* argv[]) {
-    int x_in, x_p, y_in, y_p, n, i, j;
+    int x_in, x_p, y_in, y_p, n, i, j, k;
     char c;
+    // sting manipulation stuff
+    char* ext_pos;
     // input images
     _sColorRGBA8* src_data;
     _sColorRGBA8* palette_data;
     // intermediates
     int tile_count_x, tile_count_y;
-    _sColorRGBA8** tile_data;// array of images
+    _sColorRGBA8** tile_data_rgba;// array of images
+    _tColorIndexed** tile_data_indexed;// array of images
+    float temp_dist, best_dist; // used when picking best palette for low bpp tiles
+    int best_palette;
+    uint8_t** packed_tile_data;
+    int* packed_tile_size;
 
+    // ---- parse args
     if (strncmp(argv[1], "help", 4) == 0) {
         printf("\nhelp\n");
         PrintHelp(atoi(argv[2]));
         return 0;
     }
-    if (argc < 6) {
+    if (argc < 5) {
         printf("\n could not parse parameters\n");
         PrintHelp(0);
         return 1; // Indicate error
@@ -87,15 +99,31 @@ int main(int argc, char* argv[]) {
 
     strncpy(source_file_name, argv[1], strlen(argv[1]));
     source_file_name[STRING_BUFFER_SIZE - 1] = '\0';
-    strncpy(output_file_name, argv[2], strlen(argv[2]));
-    output_file_name[STRING_BUFFER_SIZE - 1] = '\0';
-    if (argc > 6) {
-        strncpy(palette_file_name, argv[6], strlen(argv[6]));
+    if (argc > 5) {
+        strncpy(palette_file_name, argv[5], strlen(argv[5]));
         palette_file_name[STRING_BUFFER_SIZE - 1] = '\0';
         palette_mode = PALETTE_USE_IMAGE;
     }
+    strncpy(output_file_name, source_file_name, strlen(argv[1]));
+    output_file_name[STRING_BUFFER_SIZE - 1] = '\0';
+    ext_pos = strrchr(output_file_name, '.');
+    if (ext_pos) {
+        *(ext_pos + 1) = 'B';
+        *(ext_pos + 2) = 'I';
+        *(ext_pos + 3) = 'N';
+        *(ext_pos + 4) = '\0';
+    } else {
+        // no extension found, append one
+        strncat(output_file_name, ".BIN", STRING_BUFFER_SIZE - strlen(output_file_name) - 1);
+    }
+    for (i = 0; i < STRING_BUFFER_SIZE; i++) {
+        c = output_file_name[i];
+        if (c >= 'a' && c <= 'z') {
+            output_file_name[i] = c - ('a' - 'A');
+        }
+    }
 
-    target_w = atoi(argv[3]);
+    target_w = atoi(argv[2]);
     if (target_w == 320 || target_w == 640) {
         output_mode = MODE_BITMAP;
     } else if ((target_w == 8) || (target_w == 16) || (target_w == 32) || (target_w == 64)) {
@@ -104,7 +132,7 @@ int main(int argc, char* argv[]) {
         printf("invalid tile_width, valid options: 8 16 32 64 320 640");
         return 1;
     }
-    target_h = atoi(argv[4]);
+    target_h = atoi(argv[3]);
     if (output_mode == MODE_TILE) {
         if ((target_h != 8) && (target_h != 16) && (target_h != 32) && (target_h != 64)) {
             printf("invalid tile_height, valid options: 8 16 32 64");
@@ -115,7 +143,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    target_bpp = atoi(argv[5]);
+    target_bpp = atoi(argv[4]);
     if ((target_bpp != BPP_1) && (target_bpp != BPP_2) && (target_bpp != BPP_4) && (target_bpp != BPP_8)) {
         printf("invalid color_depth, valid options: 1 2 4 8");
         return 1;
@@ -130,6 +158,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     if (palette_mode == PALETTE_USE_IMAGE) {
+        printf("loading: %s \n", palette_file_name);
         palette_data = (_sColorRGBA8*)stbi_load(palette_file_name, &x_p, &y_p, &n, 4);
         if (!palette_data) {
             // could not load file
@@ -137,6 +166,8 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
+
+    printf("Source image size: %i x %i \n", x_in, y_in);
 
 
 
@@ -185,23 +216,184 @@ int main(int argc, char* argv[]) {
         tile_count_y = 1;
         break;
     }
-    tile_data = malloc((sizeof(_sColorRGBA8*) * tile_count_x * tile_count_y));
+    tile_data_rgba = malloc((sizeof(_sColorRGBA8*) * tile_count_x * tile_count_y));
+    if (!tile_data_rgba) { return 1; }
     for (j = 0; j < tile_count_y; j++) {
         for (i = 0; i < tile_count_x; i++) {
-            tile_data[i] = ExtractImageSegment(src_data, x_in, y_in, i * target_w, j * target_h, target_w, target_h);
+            tile_data_rgba[i + (j * tile_count_x)] = ExtractImageSegment(src_data, x_in, y_in, i * target_w, j * target_h, target_w, target_h);
+            if (!tile_data_rgba[i + (j * tile_count_x)]) { printf("could not allocate enough memory"); return 1; }
         }
     }
 
     // convert image segments to indexed colors
+    tile_data_indexed = malloc((sizeof(_tColorIndexed*) * tile_count_x * tile_count_y));
+    if (!tile_data_indexed) { return 1; }
+    for (j = 0; j < tile_count_y; j++) {
+        for (i = 0; i < tile_count_x; i++) {
+            if (target_bpp == BPP_8) {
+                // 8 bpp uses the one palette
+                tile_data_indexed[i + (j * tile_count_x)] = ConvertRGBAtoIndexed(
+                    tile_data_rgba[i + (j * tile_count_x)], target_w, target_h, 0, target_bpp, &temp_dist);
+                if (!tile_data_indexed[i + (j * tile_count_x)]) { printf("could not allocate enough memory"); return 1; }
+            } else {
+                // loop to find best palette
+                best_dist = INFINITY;
+                best_palette = 0;
+                for (k = 0; k < palette_size_y; k++) {
+                    temp_dist = 0;
+                    // this is very inneficient but idc, this doesn't have to run in real time or anything like that
+                    tile_data_indexed[i + (j * tile_count_x)] = ConvertRGBAtoIndexed(
+                        tile_data_rgba[i + (j * tile_count_x)], target_w, target_h, k, target_bpp, &temp_dist);
+                    if (!tile_data_indexed[i + (j * tile_count_x)]) { printf("could not allocate enough memory"); return 1; }
+                    free(tile_data_indexed[i + (j * tile_count_x)]);
 
+                    if (temp_dist < best_dist) {
+                        best_dist = temp_dist;
+                        best_palette = k;
+                    }
+                }
+                tile_data_indexed[i + (j * tile_count_x)] = ConvertRGBAtoIndexed(
+                    tile_data_rgba[i + (j * tile_count_x)], target_w, target_h, best_palette, target_bpp, &temp_dist);
+                if (!tile_data_indexed[i + (j * tile_count_x)]) { printf("could not allocate enough memory"); return 1; }
+                printf("selected palette %i for tile %i %i\n", best_palette, i, j);
+            }
+            // done with this tile, we can free the RGBA data now
+            free(tile_data_rgba[i + (j * tile_count_x)]);
+        }
+    }
+
+    // pack the indexed data into bytes
+    packed_tile_data = malloc((sizeof(_sColorRGBA8*) * tile_count_x * tile_count_y));
+    if (!packed_tile_data) { return 1; }
+    packed_tile_size = malloc((sizeof(int) * tile_count_x * tile_count_y));
+    if (!packed_tile_size) { return 1; }
+
+    for (j = 0; j < tile_count_y; j++) {
+        for (i = 0; i < tile_count_x; i++) {
+            packed_tile_data[i + (j * tile_count_x)] = PackIndexedImage(
+                tile_data_indexed[i + (j * tile_count_x)], &packed_tile_size[i + (j * tile_count_x)], target_w, target_h, target_bpp);
+            if (!packed_tile_data[i + (j * tile_count_x)]) { printf("could not allocate enough memory"); return 1; }
+            // also done with this
+            free(tile_data_indexed[i + (j * tile_count_x)]);
+        }
+    }
+
+    // write output file (finally)
+    printf("writing output file: %s \n", output_file_name);
+    FILE* f = fopen(output_file_name, "wb");
+    if (!f) { printf("could not create output file\n"); return 1; }
+
+    for (j = 0; j < tile_count_y; j++) {
+        for (i = 0; i < tile_count_x; i++) {
+            fwrite(packed_tile_data[i + (j * tile_count_x)], sizeof(uint8_t), packed_tile_size[i + (j * tile_count_x)], f);
+            free(packed_tile_data[i + (j * tile_count_x)]);
+        }
+    }
+    fclose(f);
+    printf("done!\n");
     return 0;
+}
+
+uint8_t* PackIndexedImage(_tColorIndexed* src_img, int* packed_size, int img_w, int img_h, _eBpp palette_bpp) {
+    int i, j;
+    uint8_t* data = 0;
+    assert(src_img != 0);
+    assert(img_w % 8 == 0); // width must be multiple of 8, height *could* be anything in bitmap mode but tiles are always multiple of 8
+
+    switch (palette_bpp) {
+    case BPP_1:
+        *packed_size = (sizeof(uint8_t) * img_w * img_h) / 8;
+        data = malloc((sizeof(uint8_t) * img_w * img_h) / 8);
+        if (!data) { return 0; }
+        for (j = 0; j < img_h; j++) {
+            for (i = 0; i < img_w; i += 8) {
+                // process 8 pixels at a time
+                data[(i / 8) + (j * (img_w / 8))] =
+                    ((src_img[i + (j * img_w)] & 0x01) << 7) |
+                    ((src_img[(i + 1) + (j * img_w)] & 0x01) << 6) |
+                    ((src_img[(i + 2) + (j * img_w)] & 0x01) << 5) |
+                    ((src_img[(i + 3) + (j * img_w)] & 0x01) << 4) |
+                    ((src_img[(i + 4) + (j * img_w)] & 0x01) << 3) |
+                    ((src_img[(i + 5) + (j * img_w)] & 0x01) << 2) |
+                    ((src_img[(i + 6) + (j * img_w)] & 0x01) << 1) |
+                    ((src_img[(i + 7) + (j * img_w)] & 0x01) << 0);
+            }
+        }
+        break;
+    case BPP_2:
+        *packed_size = (sizeof(uint8_t) * img_w * img_h) / 4;
+        data = malloc((sizeof(uint8_t) * img_w * img_h) / 4);
+        if (!data) { return 0; }
+        for (j = 0; j < img_h; j++) {
+            for (i = 0; i < img_w; i += 4) {
+                // process 4 pixels at a time
+                data[(i / 4) + (j * (img_w / 4))] =
+                    ((src_img[i + (j * img_w)] & 0x03) << 6) |
+                    ((src_img[(i + 1) + (j * img_w)] & 0x03) << 4) |
+                    ((src_img[(i + 2) + (j * img_w)] & 0x03) << 2) |
+                    ((src_img[(i + 3) + (j * img_w)] & 0x03) << 0);
+            }
+        }
+        break;
+    case BPP_4:
+        *packed_size = (sizeof(uint8_t) * img_w * img_h) / 2;
+        data = malloc((sizeof(uint8_t) * img_w * img_h) / 2);
+        if (!data) { return 0; }
+        for (j = 0; j < img_h; j++) {
+            for (i = 0; i < img_w; i += 2) {
+                // process 2 pixels at a time
+                data[(i / 2) + (j * (img_w / 2))] =
+                    ((src_img[i + (j * img_w)] & 0x0F) << 4) |
+                    ((src_img[(i + 1) + (j * img_w)] & 0x0F) << 0);
+            }
+        }
+        break;
+    case BPP_8:
+        *packed_size = (sizeof(uint8_t) * img_w * img_h);
+        data = malloc(sizeof(uint8_t) * img_w * img_h);
+        if (!data) { return 0; }
+        for (j = 0; j < img_h; j++) {
+            for (i = 0; i < img_w; i++) {
+                // direct copy lol
+                data[i + (j * img_w)] = src_img[i + (j * img_w)];
+            }
+        }
+        break;
+
+    default:
+        return 0;
+        break;
+    }
+
+    return data;
+}
+
+_tColorIndexed* ConvertRGBAtoIndexed(_sColorRGBA8* src_img, int img_w, int img_h, uint8_t palette_y, _eBpp palette_bpp, float* total_dist) {
+    int i, j;
+    _tColorIndexed* data = malloc(sizeof(_tColorIndexed) * img_w * img_h);
+    _tColorIndexed index = 0;
+    float dist = 0;
+    assert(src_img != 0);
+
+    if (!data) { return 0; }
+
+    for (j = 0; j < img_h; j++) {
+        for (i = 0; i < img_w; i++) {
+            GetClosestColorInPalette(src_img[i + (j * img_w)], palette_y, palette_bpp, &index, &dist);
+            *total_dist += dist;
+            data[i + (j * img_w)] = index;
+        }
+    }
+    return data;
 }
 
 _sColorRGBA8* ExtractImageSegment(_sColorRGBA8* src_img, int src_w, int src_h, int x, int y, int w, int h) {
     int i, j;
+    _sColorRGBA8 c = { 0 };
     int limit_x = x + w;
     int limit_y = y + h;
     _sColorRGBA8* data = malloc(sizeof(_sColorRGBA8) * w * h);
+    assert(src_img != 0);
     if (!data) { return 0; }
     // this also sets alpha to 0 so when mapped to palette anything missed by this function gets mapped to color 0 (transparent)
     memset(data, 0, sizeof(_sColorRGBA8) * w * h);
@@ -211,7 +403,8 @@ _sColorRGBA8* ExtractImageSegment(_sColorRGBA8* src_img, int src_w, int src_h, i
 
     for (j = y; j < limit_y; j++) {
         for (i = x; i < limit_x; i++) {
-            data[(i - x) + ((j - y) * w)] = src_img[x + (y * src_w)];
+            c = src_img[i + (j * src_w)]; // i had skill issue, it was i, j not x, y
+            data[(i - x) + ((j - y) * w)] = c;
         }
     }
     return data;
@@ -273,7 +466,7 @@ done:
     palette_size_y = (colors_picked + 15) / 16;
 }
 
-uint8_t IsColorInPalette(_sColorRGBA8 color, uint8_t palette_y, uint8_t palette_bpp, _tColorIndexed* index) {
+uint8_t IsColorInPalette(_sColorRGBA8 color, uint8_t palette_y, _eBpp palette_bpp, _tColorIndexed* index) {
     int i, j, iter, j_low, j_high;
     _sColorRGBA8 c;
     switch (palette_bpp) {
@@ -315,7 +508,7 @@ uint8_t IsColorInPalette(_sColorRGBA8 color, uint8_t palette_y, uint8_t palette_
     return 0;
 }
 
-void GetClosestColorInPalette(_sColorRGBA8 color, uint8_t palette_y, uint8_t palette_bpp, _tColorIndexed* index, float* dist) {
+void GetClosestColorInPalette(_sColorRGBA8 color, uint8_t palette_y, _eBpp palette_bpp, _tColorIndexed* index, float* dist) {
     int i, j, iter, j_low, j_high;
     float best_score = 1;
     float score = 1;
@@ -403,10 +596,6 @@ void PrintHelp(int argn) {
         printf("source_file: name (path to) input file\n accepted formats: .bmp .png");
         break;
     case 2:
-        printf("output_file: name (path to) output file\n");
-        printf("suggested: use a name in all uppercase (ex. MYIMAGE.BIN)\n");
-        break;
-    case 3:
         printf("tile_width: width encoded in output file, valid values:\n");
         printf("(selection of tile or bitmap mode is implied from value of tile_width)\n");
         printf("Tile/Sprite graphics: 8 16 32 64\n");
@@ -415,7 +604,7 @@ void PrintHelp(int argn) {
         printf("Tiles/Sprites will be split into multiple tiles (you can convert an entire spritesheet at once)\n");
         printf("Bitmaps will be cropped");
         break;
-    case 4:
+    case 3:
         printf("tile_height: height encoded in output file, valid values:\n");
         printf("Tile/Sprite graphics: 8 16 32 64\n");
         printf("Bitmap graphics: any (value becomes max height of output)\n");
@@ -423,12 +612,12 @@ void PrintHelp(int argn) {
         printf("Tiles/Sprites will be split into multiple tiles (you can convert an entire spritesheet at once)\n");
         printf("Bitmaps will be cropped");
         break;
-    case 5:
+    case 4:
         printf("color_depth: bits per pixel (bpp) encoded in output file, ei number of colors in palette, valid values:\n");
         printf("1 (monochrome)\n2 (4 colors)\n4 (16 colors)\n8 (256 colors)\n");
         printf("note that for all of these color 0 is rendered as transparent\n");
         break;
-    case 6:
+    case 5:
         printf("palette_file: path to another image file used to pick colors from\n");
         printf("this should be a 16x16 or 16x1 image\n");
         printf("if palette_file param isn't provided the first 2/4/16/256 colors of source image will be picked as a palette\n");
@@ -437,7 +626,8 @@ void PrintHelp(int argn) {
         break;
 
     default:
-        printf("Usage:\n.\\Img2VeraBin.exe [source_file] [output_file] [tile_width] [tile_height] [color_depth] (optional)[palette_file]\n");
+        printf("Usage:\n.\\Img2VeraBin.exe [source_file] [tile_width] [tile_height] [color_depth] (optional)[palette_file]\n");
+        printf("Example:\n.\\Img2VeraBin.exe my_sprite_sheet.png 32 32 4 my_palette.png\n");
         printf("You can also enter:\n.\\Img2VeraBin.exe help [param_number]\n for more details on each parameter\n");
         break;
     }
